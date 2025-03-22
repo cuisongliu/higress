@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/alibaba/higress/plugins/wasm-go/pkg/log"
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/wrapper"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
@@ -39,7 +40,7 @@ func main() {
 }
 
 const (
-	ClusterRateLimitFormat        string = "higress-token-ratelimit:%s:%s:%s:%s"
+	ClusterRateLimitFormat        string = "higress-token-ratelimit:%s:%s:%d:%d:%s:%s" // ruleName, limitType, timewindow, windowsize, key, val
 	RequestPhaseFixedWindowScript string = `
 	local ttl = redis.call('ttl', KEYS[1])
 	if ttl < 0 then
@@ -65,6 +66,8 @@ const (
 	RateLimitLimitHeader     string = "X-TokenRateLimit-Limit"     // 限制的总请求数
 	RateLimitRemainingHeader string = "X-TokenRateLimit-Remaining" // 剩余还可以发送的请求数
 	RateLimitResetHeader     string = "X-TokenRateLimit-Reset"     // 限流重置时间（触发限流时返回）
+
+	TokenRateLimitCount = "token_ratelimit_count" // metric name
 )
 
 type LimitContext struct {
@@ -79,7 +82,7 @@ type LimitRedisContext struct {
 	window int64
 }
 
-func parseConfig(json gjson.Result, config *ClusterKeyRateLimitConfig, log wrapper.Log) error {
+func parseConfig(json gjson.Result, config *ClusterKeyRateLimitConfig, log log.Log) error {
 	err := initRedisClusterClient(json, config, log)
 	if err != nil {
 		return err
@@ -88,10 +91,12 @@ func parseConfig(json gjson.Result, config *ClusterKeyRateLimitConfig, log wrapp
 	if err != nil {
 		return err
 	}
+	// Metric settings
+	config.counterMetrics = make(map[string]proxywasm.MetricCounter)
 	return nil
 }
 
-func onHttpRequestHeaders(ctx wrapper.HttpContext, config ClusterKeyRateLimitConfig, log wrapper.Log) types.Action {
+func onHttpRequestHeaders(ctx wrapper.HttpContext, config ClusterKeyRateLimitConfig, log log.Log) types.Action {
 	// 判断是否命中限流规则
 	val, ruleItem, configItem := checkRequestAgainstLimitRule(ctx, config.ruleItems, log)
 	if ruleItem == nil || configItem == nil {
@@ -99,7 +104,7 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config ClusterKeyRateLimitCon
 	}
 
 	// 构建redis限流key和参数
-	limitKey := fmt.Sprintf(ClusterRateLimitFormat, config.ruleName, ruleItem.limitType, ruleItem.key, val)
+	limitKey := fmt.Sprintf(ClusterRateLimitFormat, config.ruleName, ruleItem.limitType, configItem.timeWindow, configItem.count, ruleItem.key, val)
 	keys := []interface{}{limitKey}
 	args := []interface{}{configItem.count, configItem.timeWindow}
 
@@ -139,7 +144,7 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config ClusterKeyRateLimitCon
 	return types.ActionPause
 }
 
-func onHttpStreamingBody(ctx wrapper.HttpContext, config ClusterKeyRateLimitConfig, data []byte, endOfStream bool, log wrapper.Log) []byte {
+func onHttpStreamingBody(ctx wrapper.HttpContext, config ClusterKeyRateLimitConfig, data []byte, endOfStream bool, log log.Log) []byte {
 	var inputToken, outputToken int64
 	if inputToken, outputToken, ok := getUsage(data); ok {
 		ctx.SetContext("input_token", inputToken)
@@ -185,7 +190,7 @@ func getUsage(data []byte) (inputTokenUsage int64, outputTokenUsage int64, ok bo
 	return
 }
 
-func checkRequestAgainstLimitRule(ctx wrapper.HttpContext, ruleItems []LimitRuleItem, log wrapper.Log) (string, *LimitRuleItem, *LimitConfigItem) {
+func checkRequestAgainstLimitRule(ctx wrapper.HttpContext, ruleItems []LimitRuleItem, log log.Log) (string, *LimitRuleItem, *LimitConfigItem) {
 	for _, rule := range ruleItems {
 		val, ruleItem, configItem := hitRateRuleItem(ctx, rule, log)
 		if ruleItem != nil && configItem != nil {
@@ -195,7 +200,7 @@ func checkRequestAgainstLimitRule(ctx wrapper.HttpContext, ruleItems []LimitRule
 	return "", nil, nil
 }
 
-func hitRateRuleItem(ctx wrapper.HttpContext, rule LimitRuleItem, log wrapper.Log) (string, *LimitRuleItem, *LimitConfigItem) {
+func hitRateRuleItem(ctx wrapper.HttpContext, rule LimitRuleItem, log log.Log) (string, *LimitRuleItem, *LimitConfigItem) {
 	switch rule.limitType {
 	// 根据HTTP请求头限流
 	case limitByHeaderType, limitByPerHeaderType:
@@ -254,7 +259,7 @@ func hitRateRuleItem(ctx wrapper.HttpContext, rule LimitRuleItem, log wrapper.Lo
 	return "", nil, nil
 }
 
-func logDebugAndReturnEmpty(log wrapper.Log, errMsg string, args ...interface{}) (string, *LimitRuleItem, *LimitConfigItem) {
+func logDebugAndReturnEmpty(log log.Log, errMsg string, args ...interface{}) (string, *LimitRuleItem, *LimitConfigItem) {
 	log.Debugf(errMsg, args...)
 	return "", nil, nil
 }
@@ -304,9 +309,54 @@ func getDownStreamIp(rule LimitRuleItem) (net.IP, error) {
 	return realIP, nil
 }
 
+func (config *ClusterKeyRateLimitConfig) incrementCounter(metricName string, inc uint64) {
+	if inc == 0 {
+		return
+	}
+	counter, ok := config.counterMetrics[metricName]
+	if !ok {
+		counter = proxywasm.DefineCounterMetric(metricName)
+		config.counterMetrics[metricName] = counter
+	}
+	counter.Increment(inc)
+}
+
+func generateMetricName(route, cluster, model, consumer, metricName string) string {
+	return fmt.Sprintf("route.%s.upstream.%s.model.%s.consumer.%s.metric.%s", route, cluster, model, consumer, metricName)
+}
+
+func getRouteName() (string, error) {
+	if raw, err := proxywasm.GetProperty([]string{"route_name"}); err != nil {
+		return "-", err
+	} else {
+		return string(raw), nil
+	}
+}
+
+func getClusterName() (string, error) {
+	if raw, err := proxywasm.GetProperty([]string{"cluster_name"}); err != nil {
+		return "-", err
+	} else {
+		return string(raw), nil
+	}
+}
+
+func getConsumer() (string, error) {
+	if consumer, err := proxywasm.GetHttpRequestHeader(ConsumerHeader); err != nil {
+		return "none", err
+	} else {
+		return consumer, nil
+	}
+}
+
 func rejected(config ClusterKeyRateLimitConfig, context LimitContext) {
 	headers := make(map[string][]string)
 	headers[RateLimitResetHeader] = []string{strconv.Itoa(context.reset)}
 	_ = proxywasm.SendHttpResponseWithDetail(
 		config.rejectedCode, "ai-token-ratelimit.rejected", reconvertHeaders(headers), []byte(config.rejectedMsg), -1)
+
+	route, _ := getRouteName()
+	cluster, _ := getClusterName()
+	consumer, _ := getConsumer()
+	config.incrementCounter(generateMetricName(route, cluster, "none", consumer, TokenRateLimitCount), 1)
 }

@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/alibaba/higress/plugins/wasm-go/pkg/log"
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/wrapper"
+	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/tidwall/gjson"
 	re "github.com/wasilibs/go-re2"
 	"github.com/zmap/go-iptree/iptree"
@@ -59,6 +61,7 @@ type ClusterKeyRateLimitConfig struct {
 	rejectedCode         uint32          // 当请求超过阈值被拒绝时,返回的HTTP状态码
 	rejectedMsg          string          // 当请求超过阈值被拒绝时,返回的响应体
 	redisClient          wrapper.RedisClient
+	counterMetrics       map[string]proxywasm.MetricCounter // Metrics
 }
 
 type LimitRuleItem struct {
@@ -82,7 +85,7 @@ type LimitConfigItem struct {
 	timeWindow int64               // 时间窗口大小
 }
 
-func initRedisClusterClient(json gjson.Result, config *ClusterKeyRateLimitConfig, log wrapper.Log) error {
+func initRedisClusterClient(json gjson.Result, config *ClusterKeyRateLimitConfig, log log.Log) error {
 	redisConfig := json.Get("redis")
 	if !redisConfig.Exists() {
 		return errors.New("missing redis in config")
